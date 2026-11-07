@@ -14,3 +14,7 @@ __pycache__/
 .idea/
 database.ni
 demo.py
+
+# Local draft scripts
+dynamic_reports.sql
+partition_and_indexes.sql

@@ -1,3 +1,5 @@
+from variable import STATUS_WEIGHTS
+from variable import ORDER_STATUSES
 from variable import query_select_promotion_id
 from variable import query_select_promotion_product_id
 from variable import query_select_product_id
@@ -6,6 +8,11 @@ from variable import query_select_seller_id
 from variable import query_select_sub_category_id
 from variable import query_select_main_category_id_name
 from variable import query_select_brand_id
+from variable import query_order
+from variable import query_order_item
+from variable import query_select_product_price
+from variable import query_truncate_all
+
 from config_engine import get_engine
 import pandas as pd
 from sqlalchemy import  text
@@ -15,9 +22,9 @@ import uuid
 from datetime import datetime, timedelta
 from variable import (
     VN_PREFIXES,unique_suffixes,
-    startDate, endDate,
+    startDate, endDate, order_startDate, order_endDate,
     categories_tree, promotion_names, promotion_types, discount_types, genders,
-    query_truncate_all
+    order_statuses
 )
 fake = Faker(['vi_VN', 'en_US'])
 Faker.seed(42)
@@ -190,29 +197,131 @@ def insert_promotion_product(count=500, batch_size=100):
     df.to_sql('promotion_product', con=engine, if_exists='append', index=False, chunksize=batch_size)
     return pd.read_sql(query_select_promotion_product_id, con=engine)['promo_product_id'].tolist()
 
+def insert_orders_and_items(total_orders=5000000, batch_size=20000):
+    print(f"🚀 Bắt đầu sinh {total_orders:,} đơn hàng và ~{int(total_orders * 3.5):,} order items...")
+
+    # 1. Lấy dữ liệu nền
+    df_customers = pd.read_sql(query_select_customer_id, con=engine)
+    customer_ids = df_customers['customer_id'].tolist()
+
+    df_products = pd.read_sql(query_select_product_price, con=engine)
+    products_list = list(zip(df_products['product_id'], df_products['price'].astype(float)))
+
+    if not customer_ids or not products_list:
+        print("⚠️ Cần có dữ liệu trong customer và product trước!")
+        return
+
+    # 2. Thiết lập Pareto 80/20
+    # 20% khách VIP tạo ra 80% đơn hàng
+    vip_cutoff         = int(len(customer_ids) * 0.2)
+    vip_customers      = customer_ids[:vip_cutoff]
+    regular_customers  = customer_ids[vip_cutoff:]
+
+    # 20% sản phẩm Bestseller chiếm 80% lượt mua
+    bestseller_cutoff  = int(len(products_list) * 0.2)
+    bestseller_products = products_list[:bestseller_cutoff]
+    regular_products   = products_list[bestseller_cutoff:]
+
+
+    # Lấy order_id hiện tại để gán tuần tự (Pandas không dùng RETURNING)
+    with engine.begin() as conn:
+        current_order_id = conn.execute(text("SELECT COALESCE(MAX(order_id), 0) FROM orders")).scalar()
+
+    total_seconds      = int((order_endDate - order_startDate).total_seconds())
+    total_orders_done  = 0
+    total_items_done   = 0
+
+    # 4. Vòng lặp chia lô
+    for batch_start in range(0, total_orders, batch_size):
+        current_batch_count = min(batch_size, total_orders - batch_start)
+
+        orders_list = []
+        items_list  = []
+
+        for _ in range(current_batch_count):
+            current_order_id += 1
+
+            # Pareto khách hàng: 80% đơn từ 20% khách VIP
+            cust_id = random.choice(vip_customers) if random.random() < 0.8 else random.choice(regular_customers)
+
+            order_date = order_startDate + timedelta(seconds=random.randint(0, total_seconds))
+            created_at = order_date + timedelta(seconds=random.randint(0, 3600))
+            status     = random.choices(ORDER_STATUSES, weights=STATUS_WEIGHTS, k=1)[0]
+
+            # Pareto sản phẩm: 80% chọn từ Bestseller
+            num_items = random.randint(2, 5)
+            chosen_products = []
+            while len(chosen_products) < num_items:
+                prod = random.choice(bestseller_products) if random.random() < 0.8 else random.choice(regular_products)
+                if prod not in chosen_products:
+                    chosen_products.append(prod)
+
+            order_total = 0.0
+            for prod_id, price in chosen_products:
+                qty      = random.randint(1, 4)
+                subtotal = round(qty * price, 2)
+                order_total += subtotal
+                items_list.append({
+                    'order_id':   current_order_id,
+                    'product_id': prod_id,
+                    'order_date': order_date,
+                    'quantity':   qty,
+                    'unit_price': price,
+                    'subtotal':   subtotal,
+                    'created_at': created_at
+                })
+
+            orders_list.append({
+                'order_id':     current_order_id,
+                'customer_id':  cust_id,
+                'order_date':   order_date,
+                'status':       status,
+                'total_amount': round(order_total, 2),
+                'created_at':   created_at
+            })
+
+        # 5. Nạp vào Database
+        pd.DataFrame(orders_list).to_sql('orders',     con=engine, if_exists='append', index=False)
+        pd.DataFrame(items_list).to_sql('order_item',  con=engine, if_exists='append', index=False)
+
+        total_orders_done += current_batch_count
+        total_items_done  += len(items_list)
+        print(f"   ✓ Đã nạp (Pandas): {total_orders_done:,} / {total_orders:,} orders | {total_items_done:,} items...")
+
+    # 6. Đồng bộ lại sequence trong PostgreSQL sau khi insert explicit order_id
+    with engine.begin() as conn:
+        conn.execute(text(
+            "SELECT setval(pg_get_serial_sequence('orders', 'order_id'), "
+            "(SELECT COALESCE(MAX(order_id), 1) FROM orders));"
+        ))
+    print(f"🎉 Hoàn thành: {total_orders_done:,} orders và {total_items_done:,} order items!")
+    return total_orders_done, total_items_done
+
 def main():
-        truncate_all_tables()
+    truncate_all_tables()
 
-        brand_ids = insert_brand(count=20)
-        print(f"Brand (Pandas): {len(brand_ids)} bản ghi")
+    brand_ids = insert_brand(count=20)
+    print(f"Brand (Pandas): {len(brand_ids)} bản ghi")
 
-        category_ids = insert_category()
-        print(f"Category (Pandas): {len(category_ids)} sub-categories")
+    category_ids = insert_category()
+    print(f"Category (Pandas): {len(category_ids)} sub-categories")
 
-        seller_ids = insert_seller(count=50)
-        print(f"Seller (Pandas): {len(seller_ids)} bản ghi")
+    seller_ids = insert_seller(count=50)
+    print(f"Seller (Pandas): {len(seller_ids)} bản ghi")
 
-        customer_ids = insert_customer(count=30000, batch_size=5000)
-        print(f"Customer (Pandas): {len(customer_ids)} bản ghi")
+    customer_ids = insert_customer(count=30000, batch_size=5000)
+    print(f"Customer (Pandas): {len(customer_ids)} bản ghi")
 
-        product_ids = insert_product(count=3000, batch_size=1000)
-        print(f"Product (Pandas): {len(product_ids)} bản ghi")
+    product_ids = insert_product(count=3000, batch_size=1000)
+    print(f"Product (Pandas): {len(product_ids)} bản ghi")
 
-        promotion_ids = insert_promotion(count=30)
-        print(f"Promotion (Pandas): {len(promotion_ids)} bản ghi")
+    promotion_ids = insert_promotion(count=30)
+    print(f"Promotion (Pandas): {len(promotion_ids)} bản ghi")
 
-        promo_product_ids = insert_promotion_product(count=500, batch_size=100)
-        print(f"Promotion Product (Pandas): {len(promo_product_ids)} liên kết")
+    promo_product_ids = insert_promotion_product(count=500, batch_size=100)
+    print(f"Promotion Product (Pandas): {len(promo_product_ids)} liên kết")
+
+    insert_orders_and_items(total_orders=5000000, batch_size=20000)
 
 if __name__ == '__main__':
     main()

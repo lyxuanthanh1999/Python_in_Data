@@ -218,6 +218,30 @@ query_promotion_product = """
     VALUES (%s, %s, %s)
     ON CONFLICT (promotion_id, product_id) DO NOTHING;
 """
+
+query_order = """
+    INSERT INTO orders (customer_id, order_date, status, total_amount, created_at)
+    VALUES (%s, %s, %s, %s, %s)
+    RETURNING order_id;
+"""
+query_order_item = """
+    INSERT INTO order_item (order_id, product_id, order_date, quantity, unit_price, subtotal, created_at)
+    VALUES (%s, %s, %s, %s, %s, %s, %s);
+"""
+
+query_insert_order = """
+    INSERT INTO orders (customer_id, order_date, status, total_amount, created_at)
+    VALUES %s
+    RETURNING order_id;
+"""
+
+query_insert_order_item = """
+    INSERT INTO order_item (order_id, product_id, order_date, quantity, unit_price, subtotal, created_at)
+    VALUES %s;
+"""
+
+
+
 # =============================================================================
 # QUERY
 # =============================================================================
@@ -230,8 +254,12 @@ query_select_product_id="SELECT product_id FROM product;"
 query_select_promotion_id = "SELECT promotion_id FROM promotion;"
 query_select_promotion_product_id = "SELECT promo_product_id FROM promotion_product;"
 query_select_customer_id = """SELECT customer_id FROM customer;"""
+query_select_product_price = """SELECT product_id, price FROM product;"""
+
 query_truncate_all = """
     TRUNCATE TABLE 
+        order_item,
+        orders,
         promotion_product,
         promotion,
         product,
@@ -240,6 +268,11 @@ query_truncate_all = """
         category,
         brand
     RESTART IDENTITY CASCADE;
+"""
+query_truncate_order = """
+    TRUNCATE TABLE 
+        order_item,
+        orders;
 """
 
 # =============================================================================
@@ -266,11 +299,13 @@ categories_tree = {
             "Sách Kỹ năng sống", "Sách Kinh tế", "Sách Lập trình CNTT", "Bút viết & Vở ghi"
         ]
     }
+
 promotion_names = [
         "Mega Sale", "Flash Sale Giờ Vàng", "Siêu Sale Lương Về", "Black Friday",
         "Chào Hè Rực Rỡ", "Tết Rộn Ràng", "Back to School", "Cuối Tuần Giảm Sốc",
         "Tri Ân Khách Hàng", "Mid-Year Sale", "Đại Tiệc Mua Sắm", "Sinh Nhật Rộn Ràng"
     ]
+
 promotion_types = ['product', 'category', 'seller', 'flash_sale']
 discount_types = ['percentage', 'fixed_amount']
 genders = ['Male','Female']
@@ -282,3 +317,10 @@ VN_PREFIXES = [
     '032', '033', '035', '036', '037', '038', '039'
 ]
 unique_suffixes = random.sample(range(1000000, 10000000), 30000)
+
+ORDER_STATUSES = ['DELIVERED', 'SHIPPED', 'PAID', 'PLACED', 'CANCELLED', 'RETURNED']
+STATUS_WEIGHTS  = [0.60,        0.20,     0.10,   0.05,     0.03,        0.02]
+order_statuses  = ORDER_STATUSES   # alias cho insert_value_pandas.py
+
+order_startDate = datetime(2025, 1, 1)
+order_endDate   = datetime(2025, 5, 31, 23, 59, 59)

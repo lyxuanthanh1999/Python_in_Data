@@ -1,6 +1,13 @@
+
+
+from variable import STATUS_WEIGHTS
+from variable import query_insert_order_item
+from variable import query_truncate_order
+from variable import ORDER_STATUSES
+from variable import query_insert_order
 from datetime import timedelta
 from variable import (
-    startDate, endDate,
+    startDate, endDate,order_startDate, order_endDate, 
     # Brand & Seller
     query_brand, query_select_brand_id,
     query_seller, query_select_seller_id,
@@ -12,6 +19,8 @@ from variable import (
     # Promotion & Promotion Product
     query_promotion, query_select_promotion_id,
     query_promotion_product, query_select_promotion_product_id,
+    # Order & Order item
+    query_order,query_order_item,query_select_product_price,
     # truncate table
     query_truncate_all,
     # list data for inserting
@@ -19,13 +28,13 @@ from variable import (
     promotion_names,
     promotion_types,
     discount_types,
-    genders,VN_PREFIXES,unique_suffixes
-
+    genders,VN_PREFIXES,unique_suffixes,
 )
 
 from numpy.ma import count
 from datetime import datetime
 import psycopg2
+from psycopg2.extras import execute_values
 from faker import Faker
 import numpy as np
 from config import load_config
@@ -36,6 +45,8 @@ fake = Faker(['vi_VN','en_US'])
 Faker.seed(42)
 random.seed(42)
 # Insert query 
+def truncate_all_tables_orders(cur):
+    cur.execute(query_truncate_order)
 
 def truncate_all_tables(cur):
     cur.execute(query_truncate_all)
@@ -258,6 +269,96 @@ def insert_promotion_product(cur,count=500,batch_size=100):
     
 # order	5,000,000	~1M orders/month, distributed daily
 # order_item	17,500,000	Each order has 2–5 items (avg 3.5)
+def insert_orders_and_items(cur, total_orders=5000000, batch_size=20000):
+    print(f"Bắt đầu sinh {total_orders:,} đơn hàng và ~{int(total_orders * 3.5):,} order items...")
+    # Lấy dữ liệu
+    cur.execute(query_select_customer_id)
+    customer_ids = [r[0] for r in cur.fetchall()]
+
+    cur.execute(query_select_product_price)
+    products_list = cur.fetchall()  
+    
+    if not customer_ids or not products_list:
+        print("⚠️ Cần nạp bảng customer và product trước!")
+        return
+
+    # 20% khách VIP tạo ra 80% đơn hàng
+    vip_cutoff = int(len(customer_ids) * 0.2)
+    vip_customers = customer_ids[:vip_cutoff]
+    regular_customers = customer_ids[vip_cutoff:]
+
+    # 20% sản phẩm Bestseller chiếm 80% lượt mua
+    bestseller_cutoff = int(len(products_list) * 0.2)
+    bestseller_products = products_list[:bestseller_cutoff]
+    regular_products = products_list[bestseller_cutoff:]
+    
+    # Tính khoảng thời gian từ 01/01/2025 đến 31/05/2025
+    total_seconds = int((order_endDate - order_startDate).total_seconds())
+    orders_inserted = 0
+    items_inserted = 0
+
+    # Vòng lặp chia lô (Batching)
+    for start_idx in range(0, total_orders, batch_size):
+        current_batch_size = min(batch_size, total_orders - start_idx)
+        
+        orders_batch = []       
+        temp_order_items_meta = []  
+        for _ in range(current_batch_size):
+            # 80% đơn rơi vào khách VIP
+            if random.random() < 0.8:
+                cus_id = random.choice(vip_customers)
+            else:
+                cus_id = random.choice(regular_customers)
+
+            # Phân bố đều ngày đặt hàng từ 01/01 đến 31/05/2025
+            random_sec = random.randint(0, total_seconds)
+            order_date = order_startDate + timedelta(seconds=random_sec)
+            created_at = order_date + timedelta(seconds=random.randint(0, 3600))
+            
+            # Chọn status theo tỷ lệ đề bài
+            status = random.choices(ORDER_STATUSES, weights=STATUS_WEIGHTS, k=1)[0]
+            # Mỗi đơn từ 2 - 5 sản phẩm
+            num_items = random.randint(2, 5)
+            
+            # Quy luật Pareto cho sản phẩm: 80% chọn hàng Bestseller
+            chosen_products = []
+            while len(chosen_products) < num_items:
+                prod = random.choice(bestseller_products) if random.random() < 0.8 else random.choice(regular_products)
+                if prod not in chosen_products:
+                    chosen_products.append(prod)
+
+            order_total_amount = 0.0
+            items_for_this_order = []
+            for prod_id, price in chosen_products:
+                qty = random.randint(1, 4)
+                unit_price = float(price)
+                subtotal = round(qty * unit_price, 2)
+                order_total_amount += subtotal
+                items_for_this_order.append((prod_id, order_date, qty, unit_price, subtotal, created_at))
+                
+            order_total_amount = round(order_total_amount, 2)
+            orders_batch.append((cus_id, order_date, status, order_total_amount, created_at))
+            temp_order_items_meta.append(items_for_this_order)
+
+        # Insert orders và lấy danh sách order_id vừa tạo
+        returned_order_ids = execute_values(cur, query_insert_order, orders_batch, fetch=True)
+        order_ids = [r[0] for r in returned_order_ids]
+
+        # Ghép order_id vào các order_items tương ứng
+        order_items_batch = []
+        for o_id, items in zip(order_ids, temp_order_items_meta):
+            for prod_id, o_date, qty, u_price, subtotal, c_at in items:
+                order_items_batch.append((o_id, prod_id, o_date, qty, u_price, subtotal, c_at))
+        
+        # insert order_items
+        execute_values(cur, query_insert_order_item, order_items_batch, page_size=10000)
+        orders_inserted += current_batch_size
+        items_inserted += len(order_items_batch)
+        print(f"   ✓ Đã nạp: {orders_inserted:,} / {total_orders:,} orders | {items_inserted:,} items...")
+    print(f"🎉 Hoàn thành: {orders_inserted:,} orders và {items_inserted:,} order items!")
+    return orders_inserted, items_inserted                    
+
+
 
 
 def main():
@@ -289,6 +390,10 @@ def main():
 
                 promotion_product_ids = insert_promotion_product(cur,count=500,batch_size=100)
                 print("Promotion Product IDs:",promotion_product_ids)
+
+                order_ids = insert_orders_and_items(cur, total_orders=5000000, batch_size=20000)
+                print("Order IDs:",order_ids)
+
 
     except(Exception,psycopg2.DatabaseError)as error:
         print(error)
